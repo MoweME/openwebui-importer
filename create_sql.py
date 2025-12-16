@@ -5,7 +5,8 @@ import json
 import os
 import uuid
 import re
-import hashlib
+import base64
+import mimetypes
 
 
 def load_json(path: str) -> dict:
@@ -27,18 +28,6 @@ def slugify(value: str) -> str:
     value = value.lower()
     value = re.sub(r"[^a-z0-9_-]+", "-", value)
     return re.sub(r"-+", "-", value).strip("-")
-
-
-def calculate_hash(file_path: str) -> str:
-    """Calculate SHA256 hash of a file."""
-    sha256_hash = hashlib.sha256()
-    try:
-        with open(file_path, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-    except FileNotFoundError:
-        return "NULL"
 
 
 def tag_upserts(user_id: str, meta_tags: list[str]) -> list[str]:
@@ -66,110 +55,105 @@ def tag_upserts(user_id: str, meta_tags: list[str]) -> list[str]:
     return stmts
 
 
-def process_files(data: dict, json_path: str, user_id: str) -> list[str]:
-    """Process files in chat history and return INSERT statements."""
-    file_inserts = []
+def process_files(data: dict, json_path: str) -> None:
+    """
+    Process files in chat history:
+    1. Read file from media/ directory.
+    2. Convert to Base64 Data URI.
+    3. Update file object in message.
+    4. Remove Markdown image link from content.
+    """
     messages_map = data.get("history", {}).get("messages", {})
     
-    # Also handle list format if present (though OpenWebUI typically uses history.messages dict)
-    # But convert_chatgpt produces history.messages as dict.
-    
-    processed_file_ids = set()
+    # Track processed IDs to avoid double processing if referenced multiple times (unlikely in this structure but good practice)
+    processed_files = set()
 
     for msg_id, msg in messages_map.items():
         files = msg.get("files", [])
         if not files:
             continue
             
+        new_files_list = []
+        content = msg.get("content", "")
+        
         for f in files:
             file_id = f.get("id")
-            if not file_id or file_id in processed_file_ids:
-                continue
-                
-            processed_file_ids.add(file_id)
-            
             filename = f.get("name")
-            meta = f.get("meta", {})
-            # Add collection_name to meta as seen in working.sql
-            if "collection_name" not in meta:
-                meta["collection_name"] = f"file-{file_id}"
             
-            file_data = f.get("data", {"status": "completed"})
-            timestamp = msg.get("timestamp", data.get("timestamp", 0))
-            created_at = int(timestamp) # timestamp is usually unix timestamp (seconds or ms?)
-            # data.get("timestamp") in json_to_sql is ms. msg timestamp in convert_chatgpt is seconds (int(ts)).
-            # working.sql created_at is seconds (176...)
-            # convert_chatgpt produces msg["timestamp"] as int(ts) which is seconds.
-            
-            # Find the actual file to calculate hash
+            if not file_id or not filename:
+                # Malformed file entry, keep as is or skip?
+                new_files_list.append(f)
+                continue
+
+            # Find the actual file on disk
             # convert_chatgpt names file as {id}_{name} in media/ dir
             real_filename = f"{file_id}_{filename}"
             media_path = os.path.join(os.path.dirname(json_path), "media", real_filename)
             
-            file_hash = calculate_hash(media_path)
-            if file_hash == "NULL":
-                # Try finding it without ID prefix if failed (fallback)
+            # Fallback for file finding
+            if not os.path.exists(media_path):
                 media_path_alt = os.path.join(os.path.dirname(json_path), "media", filename)
-                file_hash_alt = calculate_hash(media_path_alt)
-                if file_hash_alt != "NULL":
-                    file_hash = file_hash_alt
-                    # But path should still use ID prefix if that's the convention
+                if os.path.exists(media_path_alt):
+                    media_path = media_path_alt
             
-            hash_val = f"'{file_hash}'" if file_hash != "NULL" else "NULL"
-            
-            # Paths
-            # DB Path: /app/backend/data/uploads/imported/{id}_{filename}
-            # URL: /uploads/imported/{id}_{filename}
-            
-            db_path = f"/app/backend/data/uploads/imported/{file_id}_{filename}"
-            url_path = f"/uploads/imported/{file_id}_{filename}"
-            
-            # Update Markdown content in message
-            content = msg.get("content", "")
-            # convert_chatgpt produces: ![name](media/{id}_{name}) or [Media: ...](media/...)
-            # regex replace media/ with /uploads/imported/
-            # Be careful not to replace other media/ strings
-            # Look for (media/{file_id}_{filename})
-            
-            # We need to update the msg object in place so it gets saved to chat JSON
-            # Construct the exact string convert_chatgpt produces to target it
-            # It uses f"{media_url_prefix}/{new_filename}" where prefix is "media" by default.
-            
-            # Regex replacement for this specific file
-            # Pattern: (media/file_id_filename) -> (/uploads/imported/file_id_filename)
-            # escape filename for regex
-            safe_name = re.escape(real_filename)
-            pattern = r"\(media/" + safe_name + r"\)"
-            replacement = f"({url_path})"
-            
-            new_content = re.sub(pattern, replacement, content)
-            msg["content"] = new_content
-            
-            # Generate SQL
-            meta_str = escape_sql_string(json.dumps(meta, ensure_ascii=True))
-            data_str = escape_sql_string(json.dumps(file_data, ensure_ascii=True))
-            filename_esc = escape_sql_string(filename)
-            db_path_esc = escape_sql_string(db_path)
-            
-            insert_stmt = (
-                f"INSERT INTO \"main\".\"file\" "
-                f"(\"id\", \"user_id\", \"filename\", \"meta\", \"created_at\", \"hash\", \"data\", \"updated_at\", \"path\", \"access_control\") "
-                f"VALUES ('{file_id}', '{user_id}', '{filename_esc}', '{meta_str}', {created_at}, {hash_val}, '{data_str}', {created_at}, '{db_path_esc}', 'null');"
-            )
-            file_inserts.append(insert_stmt)
-            
-    return file_inserts
+            if os.path.exists(media_path):
+                # Guess mime type
+                mime_type, _ = mimetypes.guess_type(media_path)
+                if not mime_type:
+                    mime_type = "application/octet-stream"
+                
+                # Read and encode
+                try:
+                    with open(media_path, "rb") as image_file:
+                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                    
+                    data_uri = f"data:{mime_type};base64,{encoded_string}"
+                    
+                    # Create new file object compliant with OpenWebUI embedded format
+                    new_file_obj = {
+                        "type": "image" if mime_type.startswith("image/") else "file",
+                        "url": data_uri,
+                        "name": filename
+                    }
+                    new_files_list.append(new_file_obj)
+                    
+                    # Remove markdown link from content
+                    # Pattern: ![filename](/uploads/imported/file_id_filename)
+                    # or ![filename](media/file_id_filename)
+                    # We match partially on the file_id to be safe
+                    
+                    # Escape ID for regex
+                    safe_id = re.escape(file_id)
+                    # Regex to match ![...](...id...)
+                    # We want to remove the whole image tag including newlines around it if possible
+                    # to avoid gaps.
+                    
+                    # This regex matches ![alt](...id...)
+                    # It handles the case where the path might differ.
+                    pattern = r"\!?\[.*?\]\(.*?" + safe_id + r".*?\)"
+                    content = re.sub(pattern, "", content)
+                    
+                except Exception as e:
+                    print(f"Error processing file {media_path}: {e}")
+                    new_files_list.append(f) # Keep original on error
+            else:
+                print(f"Warning: File not found {media_path}")
+                new_files_list.append(f)
+
+        # Update message
+        msg["files"] = new_files_list
+        msg["content"] = content.strip()
 
 
-def json_to_sql(path: str, tags: list[str]) -> tuple[str, list[str], str]:
+def json_to_sql(path: str, tags: list[str]) -> tuple[str, str]:
     data = load_json(path)
     
     user_id = data.get("userId")
     if not user_id:
         raise ValueError(f"userId missing in {path}")
         
-    # Process files first to update content in data
-    file_inserts = process_files(data, path, user_id)
+    # Process files to embed them
+    process_files(data, path)
     
     chat_json = json.dumps(data, ensure_ascii=True)
     chat_json = escape_sql_string(chat_json)
@@ -194,7 +178,7 @@ def json_to_sql(path: str, tags: list[str]) -> tuple[str, list[str], str]:
         "(\"id\",\"user_id\",\"title\",\"share_id\",\"archived\",\"created_at\",\"updated_at\",\"chat\",\"pinned\",\"meta\",\"folder_id\")\n"
         f"VALUES ('{record_id}','{user_id}','{title}',NULL,0,{created_at},{created_at},'{chat_json}',0,'{meta}',NULL);"
     )
-    return sql, file_inserts, user_id
+    return sql, user_id
 
 
 def gather_files(paths: list[str]) -> list[str]:
@@ -220,13 +204,11 @@ def main() -> None:
 
     files = gather_files(args.files)
     chat_inserts = []
-    all_file_inserts = []
     user_ids: set[str] = set()
     for fpath in files:
         try:
-            sql, f_inserts, uid = json_to_sql(fpath, tags)
+            sql, uid = json_to_sql(fpath, tags)
             chat_inserts.append(sql)
-            all_file_inserts.extend(f_inserts)
             user_ids.add(uid)
         except Exception as exc:
             raise SystemExit(f"Failed to process {fpath}: {exc}")
@@ -235,8 +217,8 @@ def main() -> None:
     for uid in sorted(user_ids):
         prefix.extend(tag_upserts(uid, tags))
 
-    # Combine: Tags -> Files -> Chats
-    output = "\n".join(prefix + all_file_inserts + chat_inserts)
+    # Combine: Tags -> Chats (Files are embedded)
+    output = "\n".join(prefix + chat_inserts)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(output + "\n")
