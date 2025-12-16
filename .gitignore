@@ -204,3 +204,5 @@ output/*
 example-usage.txt
 
 gpt-demo-export/
+
+input/

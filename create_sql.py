@@ -7,6 +7,7 @@ import uuid
 import re
 import base64
 import mimetypes
+import shutil
 
 
 def load_json(path: str) -> dict:
@@ -55,19 +56,17 @@ def tag_upserts(user_id: str, meta_tags: list[str]) -> list[str]:
     return stmts
 
 
-def process_files(data: dict, json_path: str) -> None:
+def process_files(data: dict, json_path: str, uploads_dir: str) -> None:
     """
     Process files in chat history:
     1. Read file from media/ directory.
-    2. Convert to Base64 Data URI.
-    3. Update file object in message.
-    4. Remove Markdown image link from content.
+    2. If image, Convert to Base64 Data URI.
+    3. If other, copy to uploads/ directory.
+    4. Update file object in message.
+    5. Remove Markdown image link from content.
     """
     messages_map = data.get("history", {}).get("messages", {})
     
-    # Track processed IDs to avoid double processing if referenced multiple times (unlikely in this structure but good practice)
-    processed_files = set()
-
     for msg_id, msg in messages_map.items():
         files = msg.get("files", [])
         if not files:
@@ -102,19 +101,36 @@ def process_files(data: dict, json_path: str) -> None:
                 if not mime_type:
                     mime_type = "application/octet-stream"
                 
-                # Read and encode
+                # Logic: Embed images, copy others
+                is_image = mime_type.startswith("image/")
+                
                 try:
-                    with open(media_path, "rb") as image_file:
-                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                    
-                    data_uri = f"data:{mime_type};base64,{encoded_string}"
-                    
-                    # Create new file object compliant with OpenWebUI embedded format
-                    new_file_obj = {
-                        "type": "image" if mime_type.startswith("image/") else "file",
-                        "url": data_uri,
-                        "name": filename
-                    }
+                    if is_image:
+                        # Read and encode
+                        with open(media_path, "rb") as image_file:
+                            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                        
+                        data_uri = f"data:{mime_type};base64,{encoded_string}"
+                        
+                        # Create new file object compliant with OpenWebUI embedded format
+                        new_file_obj = {
+                            "type": "image",
+                            "url": data_uri,
+                            "name": filename
+                        }
+                    else:
+                        # Copy to uploads
+                        dst_path = os.path.join(uploads_dir, real_filename)
+                        shutil.copy2(media_path, dst_path)
+                        
+                        # Reference format: /uploads/filename (Open WebUI typically serves uploads from a specific path)
+                        # Ensure we use the filename we saved with (including UUID to prevent collisions)
+                        new_file_obj = {
+                            "type": "file",
+                            "url": f"/uploads/{real_filename}",
+                            "name": filename
+                        }
+
                     new_files_list.append(new_file_obj)
                     
                     # Remove markdown link from content
@@ -145,15 +161,15 @@ def process_files(data: dict, json_path: str) -> None:
         msg["content"] = content.strip()
 
 
-def json_to_sql(path: str, tags: list[str]) -> tuple[str, str]:
+def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str]:
     data = load_json(path)
     
     user_id = data.get("userId")
     if not user_id:
         raise ValueError(f"userId missing in {path}")
         
-    # Process files to embed them
-    process_files(data, path)
+    # Process files to embed them or move to uploads
+    process_files(data, path, uploads_dir)
     
     chat_json = json.dumps(data, ensure_ascii=True)
     chat_json = escape_sql_string(chat_json)
@@ -202,16 +218,25 @@ def main() -> None:
 
     tags = [t.strip() for t in args.tags.split(',') if t.strip()] or ["imported"]
 
+    output_path = args.output or "input/chats.sql"
+    
+    # Ensure directories exist
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    uploads_dir = os.path.join(os.path.dirname(output_path), "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
+
     files = gather_files(args.files)
     chat_inserts = []
     user_ids: set[str] = set()
     for fpath in files:
         try:
-            sql, uid = json_to_sql(fpath, tags)
+            sql, uid = json_to_sql(fpath, tags, uploads_dir)
             chat_inserts.append(sql)
             user_ids.add(uid)
         except Exception as exc:
-            raise SystemExit(f"Failed to process {fpath}: {exc}")
+            # raise SystemExit(f"Failed to process {fpath}: {exc}")
+            print(f"Failed to process {fpath}: {exc}")
 
     prefix = []
     for uid in sorted(user_ids):
@@ -219,11 +244,10 @@ def main() -> None:
 
     # Combine: Tags -> Chats (Files are embedded)
     output = "\n".join(prefix + chat_inserts)
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(output + "\n")
-    else:
-        print(output)
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(output + "\n")
+    print(f"SQL written to {output_path}")
 
 
 if __name__ == "__main__":

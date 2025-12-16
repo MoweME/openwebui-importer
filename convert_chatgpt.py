@@ -57,18 +57,32 @@ def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, expo
             else:
                 # Check for various asset pointer types
                 asset_pointer = None
-                content_type = part.get("content_type")
+                content_type = part.get("content_type", "")
                 
-                if content_type in ("image_asset_pointer", "file_asset_pointer", "document_asset_pointer"):
-                    asset_pointer = part.get("asset_pointer")
-                elif content_type == "audio_asset_pointer":
-                    asset_pointer = part.get("audio_asset_pointer", {}).get("asset_pointer") or part.get("asset_pointer")
-                elif content_type == "video_asset_pointer":
-                    asset_pointer = part.get("asset_pointer")
-                elif content_type == "image_multimodal":
-                    asset_pointer = part.get("image_asset_pointer", {}).get("asset_pointer")
-                
-                # Fallback: check if asset_pointer key exists directly
+                # Generic asset pointer detection
+                if "asset_pointer" in content_type or "multimodal" in content_type:
+                    # Try to find asset pointer in common keys
+                    keys_to_check = [
+                        "asset_pointer",
+                        "image_asset_pointer",
+                        "file_asset_pointer", 
+                        "document_asset_pointer",
+                        "audio_asset_pointer",
+                        "video_asset_pointer"
+                    ]
+                    
+                    for key in keys_to_check:
+                        val = part.get(key)
+                        if isinstance(val, str):
+                            asset_pointer = val
+                            break
+                        elif isinstance(val, dict):
+                            # Handle nested structure like { "asset_pointer": "..." }
+                            if "asset_pointer" in val:
+                                asset_pointer = val["asset_pointer"]
+                                break
+
+                # Fallback: check if asset_pointer key exists directly if not found yet
                 if not asset_pointer and "asset_pointer" in part:
                     asset_pointer = part["asset_pointer"]
 
@@ -185,6 +199,8 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                     parts = msg.get("content", {}).get("parts", [])
                     if parts:
                         role = msg.get("author", {}).get("role", "assistant")
+                        if role == "tool":
+                            role = "assistant"
                         if role in {"user", "assistant"}:
                             ts_val = msg.get("create_time") or msg.get("timestamp") or ts
                             text, msg_files = _parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix)
