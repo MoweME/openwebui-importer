@@ -54,8 +54,24 @@ def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, expo
                 val = part.get("text")
                 if isinstance(val, str):
                     texts.append(sanitize_text(val))
-            elif part.get("content_type") in ("image_asset_pointer", "audio_asset_pointer", "video_asset_pointer"):
-                asset_pointer = part.get("asset_pointer") or part.get("audio_asset_pointer", {}).get("asset_pointer")
+            else:
+                # Check for various asset pointer types
+                asset_pointer = None
+                content_type = part.get("content_type")
+                
+                if content_type in ("image_asset_pointer", "file_asset_pointer", "document_asset_pointer"):
+                    asset_pointer = part.get("asset_pointer")
+                elif content_type == "audio_asset_pointer":
+                    asset_pointer = part.get("audio_asset_pointer", {}).get("asset_pointer") or part.get("asset_pointer")
+                elif content_type == "video_asset_pointer":
+                    asset_pointer = part.get("asset_pointer")
+                elif content_type == "image_multimodal":
+                    asset_pointer = part.get("image_asset_pointer", {}).get("asset_pointer")
+                
+                # Fallback: check if asset_pointer key exists directly
+                if not asset_pointer and "asset_pointer" in part:
+                    asset_pointer = part["asset_pointer"]
+
                 if asset_pointer:
                     filename = None
                     if assets_mapping:
@@ -63,7 +79,10 @@ def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, expo
                     
                     # Fallback: search in export_dir if not found in mapping
                     if not filename and export_dir:
-                        asset_id = asset_pointer.replace("sediment://", "")
+                        # Strip common prefixes to get the ID
+                        # Handles sediment:// and file-service://
+                        asset_id = asset_pointer.replace("sediment://", "").replace("file-service://", "")
+                        
                         # Search recursively in export_dir
                         for root, _, fs in os.walk(export_dir):
                             for f in fs:
@@ -106,9 +125,9 @@ def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, expo
 
                                 # Use forward slashes for URLs
                                 url_path = f"{media_url_prefix}/{new_filename}".replace("\\", "/")
-                                if part.get("content_type") == "image_asset_pointer":
+                                if content_type in ("image_asset_pointer", "image_multimodal"):
                                     texts.append(f"\n![{original_name}]({url_path})\n")
-                                elif part.get("content_type") == "audio_asset_pointer":
+                                elif content_type == "audio_asset_pointer":
                                     texts.append(f"\n[Audio: {original_name}]({url_path})\n")
                                 else:
                                     texts.append(f"\n[Media: {original_name}]({url_path})\n")

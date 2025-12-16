@@ -118,10 +118,10 @@ def process_files(data: dict, json_path: str, user_id: str) -> list[str]:
             hash_val = f"'{file_hash}'" if file_hash != "NULL" else "NULL"
             
             # Paths
-            # DB Path: /app/backend/data/imported/{id}_{filename}
+            # DB Path: /app/backend/data/uploads/imported/{id}_{filename}
             # URL: /uploads/imported/{id}_{filename}
             
-            db_path = f"/app/backend/data/imported/{file_id}_{filename}"
+            db_path = f"/app/backend/data/uploads/imported/{file_id}_{filename}"
             url_path = f"/uploads/imported/{file_id}_{filename}"
             
             # Update Markdown content in message
