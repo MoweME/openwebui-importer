@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import mimetypes
+import base64
 from typing import Any, Dict, List, Tuple
 import time
 import uuid
@@ -109,42 +110,66 @@ def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, expo
                                 break
 
                     if filename:
-                        if export_dir and media_dir:
+                        if export_dir:
                             src = os.path.join(export_dir, filename)
                             
                             # Ensure source exists
                             if os.path.exists(src):
                                 file_id = str(uuid.uuid4())
                                 original_name = os.path.basename(filename)
-                                new_filename = f"{file_id}_{original_name}"
-                                dst = os.path.join(media_dir, new_filename)
-                                
-                                shutil.copy2(src, dst)
-                                
                                 mime_type, _ = mimetypes.guess_type(original_name)
                                 file_size = os.path.getsize(src)
-                                
-                                files.append({
-                                    "id": file_id,
-                                    "name": original_name,
-                                    "meta": {
-                                        "name": original_name,
-                                        "content_type": mime_type,
-                                        "size": file_size,
-                                    },
-                                    "data": {
-                                        "status": "completed"
-                                    }
-                                })
 
-                                # Use forward slashes for URLs
-                                url_path = f"{media_url_prefix}/{new_filename}".replace("\\", "/")
-                                if content_type in ("image_asset_pointer", "image_multimodal"):
-                                    texts.append(f"\n![{original_name}]({url_path})\n")
-                                elif content_type == "audio_asset_pointer":
-                                    texts.append(f"\n[Audio: {original_name}]({url_path})\n")
-                                else:
-                                    texts.append(f"\n[Media: {original_name}]({url_path})\n")
+                                # Check if it is an image
+                                is_image = mime_type and mime_type.startswith("image/")
+                                
+                                if is_image:
+                                    with open(src, "rb") as image_file:
+                                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                                    
+                                    data_uri = f"data:{mime_type};base64,{encoded_string}"
+                                    
+                                    files.append({
+                                        "id": file_id,
+                                        "name": original_name,
+                                        "type": "image",
+                                        "url": data_uri,
+                                        "meta": {
+                                            "name": original_name,
+                                            "content_type": mime_type,
+                                            "size": file_size,
+                                        },
+                                        "data": {
+                                            "status": "completed"
+                                        }
+                                    })
+                                    # Do NOT append markdown link for embedded images
+                                    
+                                elif media_dir:
+                                    # Non-image files: copy to media_dir
+                                    new_filename = f"{file_id}_{original_name}"
+                                    dst = os.path.join(media_dir, new_filename)
+                                    shutil.copy2(src, dst)
+                                    
+                                    files.append({
+                                        "id": file_id,
+                                        "name": original_name,
+                                        "meta": {
+                                            "name": original_name,
+                                            "content_type": mime_type,
+                                            "size": file_size,
+                                        },
+                                        "data": {
+                                            "status": "completed"
+                                        }
+                                    })
+
+                                    # Use forward slashes for URLs
+                                    url_path = f"{media_url_prefix}/{new_filename}".replace("\\", "/")
+                                    if content_type == "audio_asset_pointer":
+                                        texts.append(f"\n[Audio: {original_name}]({url_path})\n")
+                                    else:
+                                        texts.append(f"\n[Media: {original_name}]({url_path})\n")
                             else:
                                 texts.append(f"\n[Media not found: {filename}]\n")
                         else:
@@ -355,8 +380,19 @@ def convert_file(path: str, user_id: str, outdir: str, media_url_prefix: str) ->
         conv_id = conv.get("conversation_id")
         unique = conv_id if conv_id else conv_uuid
         fname = f"{slugify(conv['title'])}_{unique}.json"
+        
+        # Wrap in expected OpenWebUI import format
+        wrapped = [
+            {
+                "id": "",
+                "user_id": user_id,
+                "title": out.get("title", "Untitled"),
+                "chat": out
+            }
+        ]
+        
         with open(os.path.join(outdir, fname), "w", encoding="utf-8") as fh:
-            json.dump(out, fh, ensure_ascii=False, indent=2)
+            json.dump(wrapped, fh, ensure_ascii=False, indent=2)
 
 
 def run_cli() -> None:

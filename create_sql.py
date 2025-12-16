@@ -76,6 +76,11 @@ def process_files(data: dict, json_path: str, uploads_dir: str) -> None:
         content = msg.get("content", "")
         
         for f in files:
+            # Check if already embedded (new format from convert_chatgpt.py)
+            if f.get("type") == "image" and f.get("url", "").startswith("data:"):
+                new_files_list.append(f)
+                continue
+
             file_id = f.get("id")
             filename = f.get("name")
             
@@ -164,6 +169,18 @@ def process_files(data: dict, json_path: str, uploads_dir: str) -> None:
 def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str]:
     data = load_json(path)
     
+    # Handle list wrapper (OpenWebUI export format)
+    if isinstance(data, list) and len(data) > 0:
+        data = data[0]
+
+    # Handle object wrapper with 'chat' key
+    if "chat" in data and isinstance(data["chat"], dict):
+        wrapper_user_id = data.get("user_id") or data.get("userId")
+        data = data["chat"]
+        # Ensure userId is available in the chat object
+        if wrapper_user_id and not data.get("userId"):
+            data["userId"] = wrapper_user_id
+
     user_id = data.get("userId")
     if not user_id:
         raise ValueError(f"userId missing in {path}")
