@@ -62,10 +62,12 @@ pip install -r requirements.txt
 ### convert_chatgpt.py
 
 ```
-usage: convert_chatgpt.py [-h] --userid USERID [--output-dir OUTPUT_DIR] files [files ...]
+usage: convert_chatgpt.py [-h] --userid USERID [--output-dir OUTPUT_DIR] [--media-url-prefix MEDIA_URL_PREFIX] files [files ...]
 
 Convert ChatGPT exports to open-webui JSON
 ```
+
+The `--media-url-prefix` argument allows you to specify the URL prefix for media files in the generated Markdown links. This is useful if you are hosting the media files on a separate server or if you are mounting the media directory to a specific path in OpenWebUI. Default is `media`.
 
 ### convert_grok.py
 
@@ -116,6 +118,19 @@ options:
    python ./convert_grok.py --userid="d95194d2-9cef-4387-8ee4-b82eb2e1c637" ./grok.json
    ```
    The converter writes JSON files to a subdirectory such as `output/grok`.
+
+   **For ChatGPT exports with media:**
+   If your export contains media files (images, audio), the script will automatically extract them to a `media` subdirectory within the output folder (e.g., `output/chatgpt/media`).
+   
+   To ensure these files are accessible in OpenWebUI, you should mount this `media` directory to a location accessible by the OpenWebUI container, such as `/app/backend/data/uploads`.
+   
+   Example:
+   ```bash
+   python ./convert_chatgpt.py --userid="user-id" --media-url-prefix "/uploads/imported" ./chatgpt-export/conversations.json
+   ```
+   
+   Then, when running OpenWebUI, ensure the `output/chatgpt/media` directory is mounted to `/app/backend/data/uploads/imported`.
+
 4. Generate SQL statements from the converted JSON files:
    ```bash
    python ./create_sql.py ./output --tags="imported-grok" --output=grok.sql

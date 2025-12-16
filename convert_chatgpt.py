@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 from typing import Any, Dict, List, Tuple
 import time
 import uuid
@@ -18,6 +19,7 @@ def sanitize_text(text: Any) -> str:
     if not isinstance(text, str):
         return ""
     return INVALID_RE.sub("", text)
+
 
 MODEL = "openai/GPT-5"
 MODEL_NAME = "OpenAI: GPT-5"
@@ -38,16 +40,62 @@ def extract_last_sentence(text: Any) -> str:
     return lines[-1] if lines else cleaned
 
 
-def _parts_to_text(parts: List[Any]) -> str:
+def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, export_dir: str = None, media_dir: str = None, media_url_prefix: str = "media") -> str:
     """Return concatenated text from ChatGPT message parts."""
     texts: List[str] = []
     for part in parts:
         if isinstance(part, str):
             texts.append(sanitize_text(part))
-        elif isinstance(part, dict) and "text" in part:
-            val = part.get("text")
-            if isinstance(val, str):
-                texts.append(sanitize_text(val))
+        elif isinstance(part, dict):
+            if "text" in part:
+                val = part.get("text")
+                if isinstance(val, str):
+                    texts.append(sanitize_text(val))
+            elif part.get("content_type") in ("image_asset_pointer", "audio_asset_pointer", "video_asset_pointer"):
+                asset_pointer = part.get("asset_pointer") or part.get("audio_asset_pointer", {}).get("asset_pointer")
+                if asset_pointer:
+                    filename = None
+                    if assets_mapping:
+                        filename = assets_mapping.get(asset_pointer)
+                    
+                    # Fallback: search in export_dir if not found in mapping
+                    if not filename and export_dir:
+                        asset_id = asset_pointer.replace("sediment://", "")
+                        # Search recursively in export_dir
+                        for root, _, files in os.walk(export_dir):
+                            for f in files:
+                                if asset_id in f:
+                                    # Found a match, use relative path from export_dir
+                                    abs_path = os.path.join(root, f)
+                                    filename = os.path.relpath(abs_path, export_dir)
+                                    break
+                            if filename:
+                                break
+
+                    if filename:
+                        if export_dir and media_dir:
+                            src = os.path.join(export_dir, filename)
+                            # Handle nested paths in filename (e.g. audio/file.wav)
+                            basename = os.path.basename(filename)
+                            dst = os.path.join(media_dir, basename)
+                            
+                            # Ensure source exists
+                            if os.path.exists(src):
+                                shutil.copy2(src, dst)
+                                # Use forward slashes for URLs
+                                url_path = f"{media_url_prefix}/{basename}".replace("\\", "/")
+                                if part.get("content_type") == "image_asset_pointer":
+                                    texts.append(f"\n![Image]({url_path})\n")
+                                elif part.get("content_type") == "audio_asset_pointer":
+                                    texts.append(f"\n[Audio]({url_path})\n")
+                                else:
+                                    texts.append(f"\n[Media]({url_path})\n")
+                            else:
+                                texts.append(f"\n[Media not found: {filename}]\n")
+                        else:
+                            texts.append(f"\n[Media: {filename}]\n")
+                    else:
+                        texts.append(f"\n[Media: {asset_pointer}]\n")
     return "".join(texts)
 
 
@@ -63,7 +111,7 @@ def parse_timestamp(value: Any, default: float) -> float:
     return default
 
 
-def parse_chatgpt(data: Any) -> List[dict]:
+def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: str = None, media_dir: str = None, media_url_prefix: str = "media") -> List[dict]:
     conversations = data if isinstance(data, list) else [data]
     result = []
     for item in conversations:
@@ -78,7 +126,7 @@ def parse_chatgpt(data: Any) -> List[dict]:
             for idx, msg in enumerate(item["chat_messages"]):
                 text = msg.get("text")
                 if not text and isinstance(msg.get("content"), list):
-                    text = _parts_to_text(msg["content"])
+                    text = _parts_to_text(msg["content"], assets_mapping, export_dir, media_dir, media_url_prefix)
                 text = sanitize_text(text)
                 if text:
                     role = "user" if idx % 2 == 0 else "assistant"
@@ -97,7 +145,7 @@ def parse_chatgpt(data: Any) -> List[dict]:
                         role = msg.get("author", {}).get("role", "assistant")
                         if role in {"user", "assistant"}:
                             ts_val = msg.get("create_time") or msg.get("timestamp") or ts
-                            text = sanitize_text(_parts_to_text(parts))
+                            text = sanitize_text(_parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix))
                             if text:
                                 stack.append((role, text, parse_timestamp(ts_val, ts)))
                     parent_id = node.get("parent")
@@ -127,7 +175,7 @@ def parse_chatgpt(data: Any) -> List[dict]:
                             role = msg.get("author", {}).get("role", "assistant")
                             if role in {"user", "assistant"}:
                                 ts_val = msg.get("create_time") or msg.get("timestamp") or ts
-                                text = sanitize_text(_parts_to_text(parts))
+                                text = sanitize_text(_parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix))
                                 if text:
                                     messages.append((role, text, parse_timestamp(ts_val, ts)))
                         next_ids = node.get("children") or []
@@ -201,10 +249,46 @@ def slugify(text: Any) -> str:
     return text[:50] or "chat"
 
 
-def convert_file(path: str, user_id: str, outdir: str) -> None:
+def parse_assets_mapping(export_dir: str) -> Dict[str, str]:
+    """Parse chat.html to extract assets mapping."""
+    chat_html_path = os.path.join(export_dir, "chat.html")
+    if not os.path.exists(chat_html_path):
+        print(f"Debug: chat.html not found at {chat_html_path}")
+        return {}
+    
+    try:
+        with open(chat_html_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        # Try to find the variable assignment directly
+        start_marker = "var assetsJson = "
+        start = content.find(start_marker)
+        if start != -1:
+            start += len(start_marker)
+            try:
+                decoder = json.JSONDecoder()
+                mapping, _ = decoder.raw_decode(content[start:])
+                return mapping
+            except json.JSONDecodeError:
+                pass
+    except Exception as e:
+        print(f"Warning: Failed to parse assets from chat.html: {e}")
+    
+    return {}
+
+
+def convert_file(path: str, user_id: str, outdir: str, media_url_prefix: str) -> None:
+    export_dir = os.path.dirname(path)
+    assets_mapping = parse_assets_mapping(export_dir)
+    media_dir = os.path.join(outdir, "media")
+    
+    if assets_mapping:
+        os.makedirs(media_dir, exist_ok=True)
+
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    conversations = parse_chatgpt(data)
+    
+    conversations = parse_chatgpt(data, assets_mapping, export_dir, media_dir, media_url_prefix)
     os.makedirs(outdir, exist_ok=True)
     for conv in conversations:
         out, conv_uuid = build_webui(conv, user_id)
@@ -226,11 +310,12 @@ def run_cli() -> None:
     parser.add_argument("files", nargs="+", help="ChatGPT export JSON files")
     parser.add_argument("--userid", required=True, help="User ID for output files")
     parser.add_argument("--output-dir", default="output", help="Directory for output JSON files")
+    parser.add_argument("--media-url-prefix", default="media", help="URL prefix for media files in Markdown links")
     args = parser.parse_args()
     outdir = os.path.join(args.output_dir, SUBDIR)
     for path in args.files:
         try:
-            convert_file(path, args.userid, outdir)
+            convert_file(path, args.userid, outdir, args.media_url_prefix)
         except Exception as exc:
             print(f"Failed to convert {path}: {exc}")
 
