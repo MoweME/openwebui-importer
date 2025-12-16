@@ -122,6 +122,8 @@ options:
    **For ChatGPT exports with media:**
    If your export contains media files (images, audio), the script will automatically extract them to a `media` subdirectory within the output folder (e.g., `output/chatgpt/media`).
    
+   The files are renamed with a UUID prefix (e.g., `550e8400-e29b-41d4-a716-446655440000_image.png`) to match OpenWebUI's storage convention and avoid conflicts. The generated JSON includes file metadata compatible with OpenWebUI.
+
    To ensure these files are accessible in OpenWebUI, you should mount this `media` directory to a location accessible by the OpenWebUI container, such as `/app/backend/data/uploads`.
    
    Example:
