@@ -42,6 +42,14 @@ def extract_last_sentence(text: Any) -> str:
     return lines[-1] if lines else cleaned
 
 
+def is_dalle_json(text: str) -> bool:
+    """Check if text looks like a DALL-E JSON prompt."""
+    if not isinstance(text, str):
+        return False
+    clean = text.strip()
+    return clean.startswith('{') and '"prompt":' in clean and clean.endswith('}')
+
+
 def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, export_dir: str = None, media_dir: str = None, media_url_prefix: str = "media") -> Tuple[str, List[Dict[str, Any]]]:
     """Return concatenated text and list of files from ChatGPT message parts."""
     texts: List[str] = []
@@ -280,6 +288,49 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                         next_ids = node.get("children") or []
         else:
             messages.append(("user", title, ts, []))
+            
+        # Post-process messages to merge DALL-E prompts with generated images
+        merged_messages = []
+        i = 0
+        while i < len(messages):
+            role, text, ts, files = messages[i]
+            
+            # Check for next message to merge
+            if i + 1 < len(messages):
+                next_role, next_text, next_ts, next_files = messages[i+1]
+                
+                # Check if current is assistant with text and next is image result (empty text + files)
+                # This handles both JSON prompts and text descriptions for image generation
+                if (role == "assistant" and 
+                    text and text.strip() and
+                    next_role == "assistant" and 
+                    (not next_text or next_text.strip() == "") and 
+                    next_files):
+                    
+                    # Merge - format prompt nicely with markdown blockquote
+                    prompt_text = text
+                    # If it's a JSON prompt, extract just the prompt text
+                    if is_dalle_json(text):
+                        try:
+                            prompt_data = json.loads(text)
+                            if isinstance(prompt_data, dict) and "prompt" in prompt_data:
+                                prompt_text = prompt_data["prompt"]
+                        except json.JSONDecodeError:
+                            pass
+                    
+                    formatted_content = f"**Image Generation Prompt:**\n\n> {prompt_text}"
+                    
+                    # Combine files
+                    combined_files = files + next_files
+                    merged_messages.append((role, formatted_content, ts, combined_files))
+                    i += 2
+                    continue
+            
+            merged_messages.append(messages[i])
+            i += 1
+        
+        messages = merged_messages
+
         result.append({
             "title": title,
             "timestamp": ts,
@@ -320,10 +371,10 @@ def build_webui(conversation: dict, user_id: str) -> Tuple[Dict[str, Any], str]:
                     "done": True,
                 }
             )
-        if prev_id:
-            messages_map[prev_id]["childrenIds"].append(msg_id)
         messages_map[msg_id] = msg
         messages_list.append(msg)
+        if prev_id:
+            messages_map[prev_id]["childrenIds"].append(msg_id)
         prev_id = msg_id
     webui = {
         "id": "",
