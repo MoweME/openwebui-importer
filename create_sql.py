@@ -20,7 +20,7 @@ def escape_sql_string(value: str) -> str:
 
 
 def build_meta(tags: list[str]) -> str:
-    meta = json.dumps({"tags": tags}, ensure_ascii=True)
+    meta = json.dumps({"tags": tags}, ensure_ascii=False)
     return escape_sql_string(meta)
 
 
@@ -282,11 +282,11 @@ def build_file_sql(file_record: dict) -> str:
     file_id = file_record["id"]
     user_id = file_record["user_id"]
     filename = escape_sql_string(file_record["filename"])
-    meta_json = escape_sql_string(json.dumps(file_record["meta"], ensure_ascii=True))
+    meta_json = escape_sql_string(json.dumps(file_record["meta"], ensure_ascii=False))
     created_at = file_record["created_at"]
     updated_at = file_record["updated_at"]
     file_hash = file_record["hash"]
-    data_json = escape_sql_string(json.dumps(file_record["data"], ensure_ascii=True))
+    data_json = escape_sql_string(json.dumps(file_record["data"], ensure_ascii=False))
     path = escape_sql_string(file_record["path"])
     
     return (
@@ -322,7 +322,7 @@ def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str,
     # Generate file SQL statements
     file_sqls = [build_file_sql(fr) for fr in file_records]
     
-    chat_json = json.dumps(data, ensure_ascii=True)
+    chat_json = json.dumps(data, ensure_ascii=False)
     chat_json = escape_sql_string(chat_json)
 
     title = escape_sql_string(data.get("title", ""))
@@ -398,7 +398,7 @@ def main() -> None:
     # Combine: Tags -> Files -> Chats
     output = "\n".join(prefix + file_inserts + chat_inserts)
     
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8-sig") as f:
         f.write(output + "\n")
     print(f"SQL written to {output_path}")
 
