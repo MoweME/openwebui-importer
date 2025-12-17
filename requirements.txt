@@ -1,1 +1,4 @@
 jsonschema
+ijson
+memory_profiler
+tqdm

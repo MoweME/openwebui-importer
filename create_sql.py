@@ -8,28 +8,53 @@ import re
 import base64
 import mimetypes
 import shutil
+import hashlib
+import sys
+import ijson
+import mmap
+from tqdm import tqdm
+from typing import Generator, Any, Tuple, List, Set, Dict
 
+# --- Helper Classes ---
 
-def load_json(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+class LazyImage:
+    """Delays loading of image data until JSON serialization."""
+    def __init__(self, path: str, mime_type: str):
+        self.path = path
+        self.mime_type = mime_type
 
+    def to_data_uri(self) -> str:
+        try:
+            with open(self.path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+            return f"data:{self.mime_type};base64,{encoded_string}"
+        except Exception as e:
+            sys.stderr.write(f"Error reading image {self.path}: {e}\n")
+            return "" # Or handle gracefully
+
+class CustomJSONEncoder(json.JSONEncoder):
+    """Encodes LazyImage objects to their data URI string representation."""
+    def default(self, obj):
+        if isinstance(obj, LazyImage):
+            return obj.to_data_uri()
+        return super().default(obj)
+
+# --- Helper Functions ---
 
 def escape_sql_string(value: str) -> str:
+    if not isinstance(value, str):
+        return str(value)
     return value.replace("'", "''")
-
 
 def build_meta(tags: list[str]) -> str:
     meta = json.dumps({"tags": tags}, ensure_ascii=False)
     return escape_sql_string(meta)
-
 
 def slugify(value: str) -> str:
     """Return a slug suitable for use as an identifier."""
     value = value.lower()
     value = re.sub(r"[^a-z0-9_-]+", "-", value)
     return re.sub(r"-+", "-", value).strip("-")
-
 
 def tag_upserts(user_id: str, meta_tags: list[str]) -> list[str]:
     """Return SQL statements to ensure tags exist for the user."""
@@ -55,33 +80,44 @@ def tag_upserts(user_id: str, meta_tags: list[str]) -> list[str]:
         )
     return stmts
 
-
 def compute_file_hash(filepath: str) -> str:
-    """Compute SHA256 hash of a file."""
-    import hashlib
+    """Compute SHA256 hash of a file using mmap for memory efficiency."""
+    if not os.path.exists(filepath):
+        return ""
+        
     sha256_hash = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
+    try:
+        with open(filepath, "rb") as f:
+            # Handle empty files
+            if os.path.getsize(filepath) == 0:
+                return sha256_hash.hexdigest()
+                
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
+                for i in range(0, len(mmapped_file), 8192):
+                    sha256_hash.update(mmapped_file[i:i+8192])
+    except Exception as e:
+        sys.stderr.write(f"Error computing hash for {filepath}: {e}\n")
+        # Fallback to standard read if mmap fails
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+                
     return sha256_hash.hexdigest()
 
-
-def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str) -> list[dict]:
+def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str, embed_images: bool = True) -> list[dict]:
     """
-    Process files in chat history:
-    1. Read file from media/ directory.
-    2. If image, Convert to Base64 Data URI.
-    3. If other, copy to uploads/ directory with proper format.
-    4. Update file object in message.
-    5. Remove Markdown image link from content.
-    6. Return list of file records for SQL INSERT.
+    Process files in chat history with memory optimization.
+    Returns list of file records for SQL INSERT.
     """
     messages_map = data.get("history", {}).get("messages", {})
     messages_list = data.get("messages", [])
-    file_records = []  # For SQL INSERT into file table
+    file_records = []
     
     # Create lookup for messages_list by id
     messages_list_lookup = {m.get("id"): m for m in messages_list}
+    
+    # Identify keys to process to avoid iterating everything if possible
+    # We need to update both map and list if they exist
     
     for msg_id, msg in messages_map.items():
         files = msg.get("files", [])
@@ -104,7 +140,6 @@ def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str) ->
                 filename = f.get("name") or nested_file.get("filename")
                 
                 if file_id and filename:
-                    # Find and copy the file to uploads
                     real_filename = f"{file_id}_{filename}"
                     media_path = os.path.join(os.path.dirname(json_path), "media", real_filename)
                     
@@ -121,7 +156,6 @@ def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str) ->
                             mime_type = nested_file.get("meta", {}).get("content_type", "application/octet-stream")
                         current_time = int(os.path.getmtime(media_path))
                         
-                        # Add to file records for SQL INSERT
                         file_records.append({
                             "id": file_id,
                             "user_id": user_id,
@@ -141,7 +175,7 @@ def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str) ->
                             "access_control": None
                         })
                         
-                        # Remove markdown link from content
+                        # Remove markdown link
                         safe_id = re.escape(file_id)
                         pattern = r"\!?\[.*?\]\(.*?" + safe_id + r".*?\)"
                         content = re.sub(pattern, "", content)
@@ -153,55 +187,44 @@ def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str) ->
             filename = f.get("name")
             
             if not file_id or not filename:
-                # Malformed file entry, keep as is or skip?
                 new_files_list.append(f)
                 continue
 
-            # Find the actual file on disk
-            # convert_chatgpt names file as {id}_{name} in media/ dir
             real_filename = f"{file_id}_{filename}"
             media_path = os.path.join(os.path.dirname(json_path), "media", real_filename)
             
-            # Fallback for file finding
+            # Fallback
             if not os.path.exists(media_path):
                 media_path_alt = os.path.join(os.path.dirname(json_path), "media", filename)
                 if os.path.exists(media_path_alt):
                     media_path = media_path_alt
             
             if os.path.exists(media_path):
-                # Guess mime type
                 mime_type, _ = mimetypes.guess_type(media_path)
                 if not mime_type:
                     mime_type = "application/octet-stream"
                 
-                # Logic: Embed images, copy others
                 is_image = mime_type.startswith("image/")
                 
                 try:
-                    if is_image:
-                        # Read and encode
-                        with open(media_path, "rb") as image_file:
-                            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                        
-                        data_uri = f"data:{mime_type};base64,{encoded_string}"
-                        
-                        # Create new file object compliant with OpenWebUI embedded format
+                    if is_image and embed_images:
+                        # Use LazyImage to delay loading
                         new_file_obj = {
                             "type": "image",
-                            "url": data_uri,
+                            "url": LazyImage(media_path, mime_type),
                             "name": filename
                         }
                     else:
                         # Copy to uploads
                         dst_path = os.path.join(uploads_dir, real_filename)
-                        shutil.copy2(media_path, dst_path)
+                        if not os.path.exists(dst_path):
+                            shutil.copy2(media_path, dst_path)
                         
                         file_size = os.path.getsize(media_path)
                         file_hash = compute_file_hash(media_path)
                         current_time = int(os.path.getmtime(media_path))
                         item_id = str(uuid.uuid4())
                         
-                        # Create full file structure matching OpenWebUI format
                         new_file_obj = {
                             "type": "file",
                             "file": {
@@ -231,7 +254,6 @@ def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str) ->
                             "itemId": item_id
                         }
                         
-                        # Add to file records for SQL INSERT
                         file_records.append({
                             "id": file_id,
                             "user_id": user_id,
@@ -253,29 +275,25 @@ def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str) ->
 
                     new_files_list.append(new_file_obj)
                     
-                    # Remove markdown link from content
                     safe_id = re.escape(file_id)
                     pattern = r"\!?\[.*?\]\(.*?" + safe_id + r".*?\)"
                     content = re.sub(pattern, "", content)
                     
                 except Exception as e:
-                    print(f"Error processing file {media_path}: {e}")
-                    new_files_list.append(f) # Keep original on error
+                    sys.stderr.write(f"Error processing file {media_path}: {e}\n")
+                    new_files_list.append(f)
             else:
-                print(f"Warning: File not found {media_path}")
+                sys.stderr.write(f"Warning: File not found {media_path}\n")
                 new_files_list.append(f)
 
-        # Update message in history.messages
         msg["files"] = new_files_list
         msg["content"] = content.strip()
         
-        # Also update the corresponding message in messages array
         if msg_id in messages_list_lookup:
             messages_list_lookup[msg_id]["files"] = new_files_list
             messages_list_lookup[msg_id]["content"] = content.strip()
     
     return file_records
-
 
 def build_file_sql(file_record: dict) -> str:
     """Generate SQL INSERT statement for a file record."""
@@ -296,46 +314,49 @@ def build_file_sql(file_record: dict) -> str:
         f"VALUES ('{file_id}','{user_id}','{filename}','{meta_json}',{created_at},'{file_hash}','{data_json}',{updated_at},'{path}','null');"
     )
 
-
-def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str, list[str]]:
-    data = load_json(path)
+def process_single_conversation(data: dict, json_path: str, tags: list[str], uploads_dir: str, embed_images: bool) -> Tuple[str, str, List[str]]:
+    """Process a single conversation object and return SQL statements."""
     
-    # Handle list wrapper (OpenWebUI export format)
-    if isinstance(data, list) and len(data) > 0:
-        data = data[0]
-
-    # Handle object wrapper with 'chat' key
+    # Handle object wrapper with 'chat' key (common in some exports)
     if "chat" in data and isinstance(data["chat"], dict):
         wrapper_user_id = data.get("user_id") or data.get("userId")
         data = data["chat"]
-        # Ensure userId is available in the chat object
         if wrapper_user_id and not data.get("userId"):
             data["userId"] = wrapper_user_id
 
     user_id = data.get("userId")
     if not user_id:
-        raise ValueError(f"userId missing in {path}")
+        # If no user_id, warn and skip or use placeholder?
+        # sys.stderr.write(f"Warning: userId missing in conversation, using 'unknown'\n")
+        return "", "", []
         
-    # Process files to embed them or move to uploads
-    file_records = process_files(data, path, uploads_dir, user_id)
-    
-    # Generate file SQL statements
+    file_records = process_files(data, json_path, uploads_dir, user_id, embed_images)
     file_sqls = [build_file_sql(fr) for fr in file_records]
     
-    chat_json = json.dumps(data, ensure_ascii=False)
+    # Use CustomJSONEncoder to handle LazyImage serialization
+    chat_json = json.dumps(data, ensure_ascii=False, cls=CustomJSONEncoder)
     chat_json = escape_sql_string(chat_json)
 
     title = escape_sql_string(data.get("title", ""))
     timestamp_ms = data.get("timestamp", 0)
     created_at = int(int(timestamp_ms) / 1000)
 
-    base = os.path.splitext(os.path.basename(path))[0]
-    possible_id = base.split("_")[-1]
-    try:
-        uuid.UUID(possible_id)
-        record_id = possible_id
-    except ValueError:
-        record_id = str(uuid.uuid4())
+    # Determine record ID
+    # Try to extract from path if possible, or use data ID?
+    # Original logic used filename. Here we might need to rely on ID in data or generate new.
+    # Since we are streaming, we might not rely on filename for ID if inside a list.
+    # But we have json_path.
+    
+    record_id = data.get("id")
+    if not record_id:
+         # Fallback to logic based on path if available, or random
+         base = os.path.splitext(os.path.basename(json_path))[0]
+         possible_id = base.split("_")[-1]
+         try:
+             uuid.UUID(possible_id)
+             record_id = possible_id
+         except ValueError:
+             record_id = str(uuid.uuid4())
 
     meta = build_meta(tags)
 
@@ -347,6 +368,103 @@ def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str,
     )
     return sql, user_id, file_sqls
 
+def process_file_path(path: str, tags: list[str], uploads_dir: str, output_file, embed_images: bool, batch_size: int, pbar: tqdm = None) -> Set[str]:
+    """Reads a file (which can be a list or dict) and writes SQL to output."""
+    user_ids = set()
+    
+    try:
+        # Detect if file is list or dict
+        # We can use ijson to stream items if it's a list.
+        # If it's a dict, we just load it (assuming single dict fits in memory).
+        
+        # Check first char
+        is_list = False
+        with open(path, 'rb') as f:
+            while True:
+                chunk = f.read(1024)
+                if not chunk: break
+                s = chunk.strip()
+                if not s: continue
+                if s.startswith(b'['):
+                    is_list = True
+                break
+        
+        # Helper to wrap file for tqdm
+        # We only wrap if we have a pbar provided
+        def get_file_ctx():
+            if pbar:
+                return tqdm.wrapattr(open(path, 'rb'), "read", total=os.path.getsize(path), file=pbar)
+            return open(path, 'rb')
+
+        # Since we use one global pbar, we can't easily use wrapattr for multiple files unless we update the global one.
+        # Instead, let's create a wrapper class that updates the pbar manually.
+        
+        class ProgressFile:
+            def __init__(self, path, pbar):
+                self.f = open(path, 'rb')
+                self.pbar = pbar
+                
+            def read(self, size=-1):
+                data = self.f.read(size)
+                if self.pbar:
+                    self.pbar.update(len(data))
+                return data
+                
+            def close(self):
+                self.f.close()
+                
+            def __enter__(self):
+                return self
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.close()
+
+        if is_list:
+            with ProgressFile(path, pbar) as f:
+                # Iterate over items in the list
+                # ijson.items(f, 'item') parses each item in the top-level list
+                items = ijson.items(f, 'item')
+                count = 0
+                for data in items:
+                    sql, uid, file_sqls = process_single_conversation(data, path, tags, uploads_dir, embed_images)
+                    if sql:
+                        # Write Files SQL first
+                        for fsql in file_sqls:
+                            output_file.write(fsql + "\n")
+                        output_file.write(sql + "\n")
+                        user_ids.add(uid)
+                        count += 1
+                        
+                        if count % batch_size == 0:
+                            output_file.flush()
+                            if pbar:
+                                pbar.set_description(f"Processing (convs: {count})")
+        else:
+            # Assume single object
+            # For single object, ijson works but json.load is simpler if it fits. 
+            # But we want progress. Let's stick to reading with ProgressFile and json.load
+            # json.load accepts a file-like object with .read()
+            with ProgressFile(path, pbar) as f:
+                data = json.load(f)
+            
+            # Handle the case where it might be wrapped in a list but short (old behavior)
+            if isinstance(data, list) and len(data) > 0:
+                data = data[0] # Original script behavior for lists
+            
+            sql, uid, file_sqls = process_single_conversation(data, path, tags, uploads_dir, embed_images)
+            if sql:
+                for fsql in file_sqls:
+                    output_file.write(fsql + "\n")
+                output_file.write(sql + "\n")
+                user_ids.add(uid)
+                output_file.flush()
+
+    except Exception as e:
+        sys.stderr.write(f"Failed to process {path}: {e}\n")
+        import traceback
+        traceback.print_exc()
+
+    return user_ids
 
 def gather_files(paths: list[str]) -> list[str]:
     result = []
@@ -359,17 +477,20 @@ def gather_files(paths: list[str]) -> list[str]:
             result.append(p)
     return result
 
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create SQL inserts for open-webui chats")
+    parser = argparse.ArgumentParser(description="Create SQL inserts for open-webui chats (Optimized)")
     parser.add_argument("files", nargs="+", help="Chat JSON files or directories")
     parser.add_argument("--tags", default="imported", help="Comma-separated tags for the meta field")
-    parser.add_argument("--output", help="Write SQL statements to this file")
+    parser.add_argument("--output", help="Write SQL statements to this file", default="input/chats.sql")
+    parser.add_argument("--batch-size", type=int, default=50, help="Flush to disk after N conversations")
+    parser.add_argument("--no-embed-images", action="store_true", help="Do not embed images as base64")
+    # Added for compatibility with plan, though we always try to be memory efficient now
+    parser.add_argument("--low-memory", action="store_true", help="Use memory optimized processing (default behavior now)")
+    
     args = parser.parse_args()
 
     tags = [t.strip() for t in args.tags.split(',') if t.strip()] or ["imported"]
-
-    output_path = args.output or "input/chats.sql"
+    output_path = args.output
     
     # Ensure directories exist
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -378,30 +499,39 @@ def main() -> None:
     os.makedirs(uploads_dir, exist_ok=True)
 
     files = gather_files(args.files)
-    chat_inserts = []
-    file_inserts = []
-    user_ids: set[str] = set()
-    for fpath in files:
-        try:
-            sql, uid, file_sqls = json_to_sql(fpath, tags, uploads_dir)
-            chat_inserts.append(sql)
-            file_inserts.extend(file_sqls)
-            user_ids.add(uid)
-        except Exception as exc:
-            # raise SystemExit(f"Failed to process {fpath}: {exc}")
-            print(f"Failed to process {fpath}: {exc}")
-
-    prefix = []
-    for uid in sorted(user_ids):
-        prefix.extend(tag_upserts(uid, tags))
-
-    # Combine: Tags -> Files -> Chats
-    output = "\n".join(prefix + file_inserts + chat_inserts)
+    all_user_ids = set()
     
-    with open(output_path, "w", encoding="utf-8-sig") as f:
-        f.write(output + "\n")
-    print(f"SQL written to {output_path}")
+    # Calculate total size
+    total_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+    
+    print(f"Processing {len(files)} files ({total_size / (1024*1024):.2f} MB) to {output_path}...")
+    
+    # Open output file once
+    with open(output_path, "w", encoding="utf-8-sig") as out_f:
+        # Use a single progress bar for all files
+        with tqdm(total=total_size, unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+            for fpath in files:
+                pbar.set_description(f"Processing {os.path.basename(fpath)}")
+                uids = process_file_path(
+                    fpath, 
+                    tags, 
+                    uploads_dir, 
+                    out_f, 
+                    not args.no_embed_images, 
+                    args.batch_size,
+                    pbar
+                )
+                all_user_ids.update(uids)
 
+        # Write tag upserts at the end
+        if all_user_ids:
+            out_f.write("\n-- Tag Upserts --\n")
+            for uid in sorted(all_user_ids):
+                stmts = tag_upserts(uid, tags)
+                for stmt in stmts:
+                    out_f.write(stmt + "\n")
+
+    print(f"\nSQL written to {output_path}")
 
 if __name__ == "__main__":
     main()
