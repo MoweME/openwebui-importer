@@ -121,7 +121,21 @@ def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, expo
                                 file_size = os.path.getsize(src)
 
                                 # Check if it is an image
-                                is_image = mime_type and mime_type.startswith("image/")
+                                is_image = False
+                                if mime_type and mime_type.startswith("image/"):
+                                    is_image = True
+                                elif original_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                                    is_image = True
+                                    if not mime_type:
+                                        # Fallback mime type if guess_type failed but extension matched
+                                        if original_name.lower().endswith('.png'):
+                                            mime_type = "image/png"
+                                        elif original_name.lower().endswith(('.jpg', '.jpeg')):
+                                            mime_type = "image/jpeg"
+                                        elif original_name.lower().endswith('.gif'):
+                                            mime_type = "image/gif"
+                                        elif original_name.lower().endswith('.webp'):
+                                            mime_type = "image/webp"
                                 
                                 if is_image:
                                     with open(src, "rb") as image_file:
@@ -209,7 +223,7 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                 if not text and isinstance(msg.get("content"), list):
                     text, msg_files = _parts_to_text(msg["content"], assets_mapping, export_dir, media_dir, media_url_prefix)
                 text = sanitize_text(text)
-                if text:
+                if text or msg_files:
                     role = "user" if idx % 2 == 0 else "assistant"
                     messages.append((role, text, ts, msg_files))
         elif isinstance(item.get("mapping"), dict):
@@ -230,7 +244,7 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                             ts_val = msg.get("create_time") or msg.get("timestamp") or ts
                             text, msg_files = _parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix)
                             text = sanitize_text(text)
-                            if text:
+                            if text or msg_files:
                                 stack.append((role, text, parse_timestamp(ts_val, ts), msg_files))
                     parent_id = node.get("parent")
                     if not parent_id:
@@ -261,7 +275,7 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                                 ts_val = msg.get("create_time") or msg.get("timestamp") or ts
                                 text, msg_files = _parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix)
                                 text = sanitize_text(text)
-                                if text:
+                                if text or msg_files:
                                     messages.append((role, text, parse_timestamp(ts_val, ts), msg_files))
                         next_ids = node.get("children") or []
         else:
