@@ -56,16 +56,32 @@ def tag_upserts(user_id: str, meta_tags: list[str]) -> list[str]:
     return stmts
 
 
-def process_files(data: dict, json_path: str, uploads_dir: str) -> None:
+def compute_file_hash(filepath: str) -> str:
+    """Compute SHA256 hash of a file."""
+    import hashlib
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+
+def process_files(data: dict, json_path: str, uploads_dir: str, user_id: str) -> list[dict]:
     """
     Process files in chat history:
     1. Read file from media/ directory.
     2. If image, Convert to Base64 Data URI.
-    3. If other, copy to uploads/ directory.
+    3. If other, copy to uploads/ directory with proper format.
     4. Update file object in message.
     5. Remove Markdown image link from content.
+    6. Return list of file records for SQL INSERT.
     """
     messages_map = data.get("history", {}).get("messages", {})
+    messages_list = data.get("messages", [])
+    file_records = []  # For SQL INSERT into file table
+    
+    # Create lookup for messages_list by id
+    messages_list_lookup = {m.get("id"): m for m in messages_list}
     
     for msg_id, msg in messages_map.items():
         files = msg.get("files", [])
@@ -76,8 +92,60 @@ def process_files(data: dict, json_path: str, uploads_dir: str) -> None:
         content = msg.get("content", "")
         
         for f in files:
-            # Check if already embedded (new format from convert_chatgpt.py)
+            # Check if already embedded image (base64 data URI)
             if f.get("type") == "image" and f.get("url", "").startswith("data:"):
+                new_files_list.append(f)
+                continue
+            
+            # Check if already in full format with nested file object
+            if f.get("type") == "file" and isinstance(f.get("file"), dict):
+                nested_file = f["file"]
+                file_id = f.get("id") or nested_file.get("id")
+                filename = f.get("name") or nested_file.get("filename")
+                
+                if file_id and filename:
+                    # Find and copy the file to uploads
+                    real_filename = f"{file_id}_{filename}"
+                    media_path = os.path.join(os.path.dirname(json_path), "media", real_filename)
+                    
+                    if os.path.exists(media_path):
+                        # Copy to uploads
+                        dst_path = os.path.join(uploads_dir, real_filename)
+                        if not os.path.exists(dst_path):
+                            shutil.copy2(media_path, dst_path)
+                        
+                        file_size = os.path.getsize(media_path)
+                        file_hash = compute_file_hash(media_path)
+                        mime_type, _ = mimetypes.guess_type(media_path)
+                        if not mime_type:
+                            mime_type = nested_file.get("meta", {}).get("content_type", "application/octet-stream")
+                        current_time = int(os.path.getmtime(media_path))
+                        
+                        # Add to file records for SQL INSERT
+                        file_records.append({
+                            "id": file_id,
+                            "user_id": user_id,
+                            "filename": filename,
+                            "meta": {
+                                "name": filename,
+                                "content_type": mime_type,
+                                "size": file_size,
+                                "data": {},
+                                "collection_name": f"file-{file_id}"
+                            },
+                            "created_at": current_time,
+                            "updated_at": current_time,
+                            "hash": file_hash,
+                            "data": {"status": "completed"},
+                            "path": f"/app/backend/data/uploads/{real_filename}",
+                            "access_control": None
+                        })
+                        
+                        # Remove markdown link from content
+                        safe_id = re.escape(file_id)
+                        pattern = r"\!?\[.*?\]\(.*?" + safe_id + r".*?\)"
+                        content = re.sub(pattern, "", content)
+                
                 new_files_list.append(f)
                 continue
 
@@ -128,29 +196,65 @@ def process_files(data: dict, json_path: str, uploads_dir: str) -> None:
                         dst_path = os.path.join(uploads_dir, real_filename)
                         shutil.copy2(media_path, dst_path)
                         
-                        # Reference format: /uploads/filename (Open WebUI typically serves uploads from a specific path)
-                        # Ensure we use the filename we saved with (including UUID to prevent collisions)
+                        file_size = os.path.getsize(media_path)
+                        file_hash = compute_file_hash(media_path)
+                        current_time = int(os.path.getmtime(media_path))
+                        item_id = str(uuid.uuid4())
+                        
+                        # Create full file structure matching OpenWebUI format
                         new_file_obj = {
                             "type": "file",
-                            "url": f"/uploads/{real_filename}",
-                            "name": filename
+                            "file": {
+                                "id": file_id,
+                                "user_id": user_id,
+                                "hash": file_hash,
+                                "filename": filename,
+                                "data": {"status": "completed"},
+                                "meta": {
+                                    "name": filename,
+                                    "content_type": mime_type,
+                                    "size": file_size,
+                                    "data": {}
+                                },
+                                "created_at": current_time,
+                                "updated_at": current_time,
+                                "status": True,
+                                "path": f"/app/backend/data/uploads/{real_filename}",
+                                "access_control": None
+                            },
+                            "id": file_id,
+                            "url": f"/api/v1/files/{file_id}",
+                            "name": filename,
+                            "status": "uploaded",
+                            "size": file_size,
+                            "error": "",
+                            "itemId": item_id
                         }
+                        
+                        # Add to file records for SQL INSERT
+                        file_records.append({
+                            "id": file_id,
+                            "user_id": user_id,
+                            "filename": filename,
+                            "meta": {
+                                "name": filename,
+                                "content_type": mime_type,
+                                "size": file_size,
+                                "data": {},
+                                "collection_name": f"file-{file_id}"
+                            },
+                            "created_at": current_time,
+                            "updated_at": current_time,
+                            "hash": file_hash,
+                            "data": {"status": "completed"},
+                            "path": f"/app/backend/data/uploads/{real_filename}",
+                            "access_control": None
+                        })
 
                     new_files_list.append(new_file_obj)
                     
                     # Remove markdown link from content
-                    # Pattern: ![filename](/uploads/imported/file_id_filename)
-                    # or ![filename](media/file_id_filename)
-                    # We match partially on the file_id to be safe
-                    
-                    # Escape ID for regex
                     safe_id = re.escape(file_id)
-                    # Regex to match ![...](...id...)
-                    # We want to remove the whole image tag including newlines around it if possible
-                    # to avoid gaps.
-                    
-                    # This regex matches ![alt](...id...)
-                    # It handles the case where the path might differ.
                     pattern = r"\!?\[.*?\]\(.*?" + safe_id + r".*?\)"
                     content = re.sub(pattern, "", content)
                     
@@ -161,12 +265,39 @@ def process_files(data: dict, json_path: str, uploads_dir: str) -> None:
                 print(f"Warning: File not found {media_path}")
                 new_files_list.append(f)
 
-        # Update message
+        # Update message in history.messages
         msg["files"] = new_files_list
         msg["content"] = content.strip()
+        
+        # Also update the corresponding message in messages array
+        if msg_id in messages_list_lookup:
+            messages_list_lookup[msg_id]["files"] = new_files_list
+            messages_list_lookup[msg_id]["content"] = content.strip()
+    
+    return file_records
 
 
-def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str]:
+def build_file_sql(file_record: dict) -> str:
+    """Generate SQL INSERT statement for a file record."""
+    file_id = file_record["id"]
+    user_id = file_record["user_id"]
+    filename = escape_sql_string(file_record["filename"])
+    meta_json = escape_sql_string(json.dumps(file_record["meta"], ensure_ascii=True))
+    created_at = file_record["created_at"]
+    updated_at = file_record["updated_at"]
+    file_hash = file_record["hash"]
+    data_json = escape_sql_string(json.dumps(file_record["data"], ensure_ascii=True))
+    path = escape_sql_string(file_record["path"])
+    
+    return (
+        f"DELETE FROM \"file\" WHERE \"id\" = '{file_id}';\n"
+        "INSERT INTO \"file\" "
+        "(\"id\",\"user_id\",\"filename\",\"meta\",\"created_at\",\"hash\",\"data\",\"updated_at\",\"path\",\"access_control\")\n"
+        f"VALUES ('{file_id}','{user_id}','{filename}','{meta_json}',{created_at},'{file_hash}','{data_json}',{updated_at},'{path}','null');"
+    )
+
+
+def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str, list[str]]:
     data = load_json(path)
     
     # Handle list wrapper (OpenWebUI export format)
@@ -186,7 +317,10 @@ def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str]
         raise ValueError(f"userId missing in {path}")
         
     # Process files to embed them or move to uploads
-    process_files(data, path, uploads_dir)
+    file_records = process_files(data, path, uploads_dir, user_id)
+    
+    # Generate file SQL statements
+    file_sqls = [build_file_sql(fr) for fr in file_records]
     
     chat_json = json.dumps(data, ensure_ascii=True)
     chat_json = escape_sql_string(chat_json)
@@ -211,7 +345,7 @@ def json_to_sql(path: str, tags: list[str], uploads_dir: str) -> tuple[str, str]
         "(\"id\",\"user_id\",\"title\",\"share_id\",\"archived\",\"created_at\",\"updated_at\",\"chat\",\"pinned\",\"meta\",\"folder_id\")\n"
         f"VALUES ('{record_id}','{user_id}','{title}',NULL,0,{created_at},{created_at},'{chat_json}',0,'{meta}',NULL);"
     )
-    return sql, user_id
+    return sql, user_id, file_sqls
 
 
 def gather_files(paths: list[str]) -> list[str]:
@@ -245,11 +379,13 @@ def main() -> None:
 
     files = gather_files(args.files)
     chat_inserts = []
+    file_inserts = []
     user_ids: set[str] = set()
     for fpath in files:
         try:
-            sql, uid = json_to_sql(fpath, tags, uploads_dir)
+            sql, uid, file_sqls = json_to_sql(fpath, tags, uploads_dir)
             chat_inserts.append(sql)
+            file_inserts.extend(file_sqls)
             user_ids.add(uid)
         except Exception as exc:
             # raise SystemExit(f"Failed to process {fpath}: {exc}")
@@ -259,8 +395,8 @@ def main() -> None:
     for uid in sorted(user_ids):
         prefix.extend(tag_upserts(uid, tags))
 
-    # Combine: Tags -> Chats (Files are embedded)
-    output = "\n".join(prefix + chat_inserts)
+    # Combine: Tags -> Files -> Chats
+    output = "\n".join(prefix + file_inserts + chat_inserts)
     
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(output + "\n")

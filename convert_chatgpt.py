@@ -50,7 +50,7 @@ def is_dalle_json(text: str) -> bool:
     return clean.startswith('{') and '"prompt":' in clean and clean.endswith('}')
 
 
-def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, export_dir: str = None, media_dir: str = None, media_url_prefix: str = "media") -> Tuple[str, List[Dict[str, Any]]]:
+def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, export_dir: str = None, media_dir: str = None, media_url_prefix: str = "media", user_id: str = "") -> Tuple[str, List[Dict[str, Any]]]:
     """Return concatenated text and list of files from ChatGPT message parts."""
     texts: List[str] = []
     files: List[Dict[str, Any]] = []
@@ -173,21 +173,41 @@ def _parts_to_text(parts: List[Any], assets_mapping: Dict[str, str] = None, expo
                                     dst = os.path.join(media_dir, new_filename)
                                     shutil.copy2(src, dst)
                                     
-                                    files.append({
-                                        "id": file_id,
-                                        "name": original_name,
-                                        "meta": {
-                                            "name": original_name,
-                                            "content_type": mime_type,
-                                            "size": file_size,
-                                        },
-                                        "data": {
-                                            "status": "completed"
-                                        }
-                                    })
-
                                     # Use forward slashes for URLs
                                     url_path = f"{media_url_prefix}/{new_filename}".replace("\\", "/")
+                                    current_time = int(time.time())
+                                    item_id = str(uuid.uuid4())
+                                    
+                                    # Create full file structure matching OpenWebUI format
+                                    files.append({
+                                        "type": "file",
+                                        "file": {
+                                            "id": file_id,
+                                            "user_id": user_id,
+                                            "hash": None,
+                                            "filename": original_name,
+                                            "data": {"status": "completed"},
+                                            "meta": {
+                                                "name": original_name,
+                                                "content_type": mime_type,
+                                                "size": file_size,
+                                                "data": {}
+                                            },
+                                            "created_at": current_time,
+                                            "updated_at": current_time,
+                                            "status": True,
+                                            "path": f"/app/backend/data/uploads/{new_filename}",
+                                            "access_control": None
+                                        },
+                                        "id": file_id,
+                                        "url": f"/api/v1/files/{file_id}",
+                                        "name": original_name,
+                                        "status": "uploaded",
+                                        "size": file_size,
+                                        "error": "",
+                                        "itemId": item_id
+                                    })
+
                                     if content_type == "audio_asset_pointer":
                                         texts.append(f"\n[Audio: {original_name}]({url_path})\n")
                                     else:
@@ -213,7 +233,7 @@ def parse_timestamp(value: Any, default: float) -> float:
     return default
 
 
-def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: str = None, media_dir: str = None, media_url_prefix: str = "media") -> List[dict]:
+def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: str = None, media_dir: str = None, media_url_prefix: str = "media", user_id: str = "") -> List[dict]:
     conversations = data if isinstance(data, list) else [data]
     result = []
     for item in conversations:
@@ -229,7 +249,7 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                 text = msg.get("text")
                 msg_files = []
                 if not text and isinstance(msg.get("content"), list):
-                    text, msg_files = _parts_to_text(msg["content"], assets_mapping, export_dir, media_dir, media_url_prefix)
+                    text, msg_files = _parts_to_text(msg["content"], assets_mapping, export_dir, media_dir, media_url_prefix, user_id)
                 text = sanitize_text(text)
                 if text or msg_files:
                     role = "user" if idx % 2 == 0 else "assistant"
@@ -250,7 +270,7 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                             role = "assistant"
                         if role in {"user", "assistant"}:
                             ts_val = msg.get("create_time") or msg.get("timestamp") or ts
-                            text, msg_files = _parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix)
+                            text, msg_files = _parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix, user_id)
                             text = sanitize_text(text)
                             if text or msg_files:
                                 stack.append((role, text, parse_timestamp(ts_val, ts), msg_files))
@@ -281,7 +301,7 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                             role = msg.get("author", {}).get("role", "assistant")
                             if role in {"user", "assistant"}:
                                 ts_val = msg.get("create_time") or msg.get("timestamp") or ts
-                                text, msg_files = _parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix)
+                                text, msg_files = _parts_to_text(parts, assets_mapping, export_dir, media_dir, media_url_prefix, user_id)
                                 text = sanitize_text(text)
                                 if text or msg_files:
                                     messages.append((role, text, parse_timestamp(ts_val, ts), msg_files))
@@ -438,7 +458,7 @@ def convert_file(path: str, user_id: str, outdir: str, media_url_prefix: str) ->
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     
-    conversations = parse_chatgpt(data, assets_mapping, export_dir, media_dir, media_url_prefix)
+    conversations = parse_chatgpt(data, assets_mapping, export_dir, media_dir, media_url_prefix, user_id)
     os.makedirs(outdir, exist_ok=True)
     for conv in conversations:
         out, conv_uuid = build_webui(conv, user_id)
