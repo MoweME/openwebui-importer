@@ -128,21 +128,21 @@ options:
    python create_sql.py ./output/chatgpt
    ```
 
-  Creates a new folder called `input` which contains the ready-to-import SQL file and prepared media files.
+   Creates a new folder called `input` which contains the ready-to-import SQL file and prepared media files.
 
-  Note: OpenWebUI saves most images in the database. The created uploads folder may not contain these images.
-  They're included in the generated SQL file.
+   Note: OpenWebUI saves most images in the database. The created uploads folder may not contain these images.
+   They're included in the generated SQL file.
 
-  The resulting SQL removes any existing chats with the same IDs before
-  inserting new ones, while tags are inserted using UPSERTs so they are
-  updated if they already exist. Any tags passed with `--tags` are also created
-  for each user.
+   The resulting SQL removes any existing chats with the same IDs before
+   inserting new ones, while tags are inserted using UPSERTs so they are
+   updated if they already exist. Any tags passed with `--tags` are also created
+   for each user.
 
 5. Make a copy of your `webui.db` database.
 6. Stop your running OpenWebUI instance
 7. Execute the generated SQL using a tool such as [DB Browser for SQLite](https://sqlitebrowser.org/dl/) or [HeidiSQL](https://www.heidisql.com/download.php).
-  Ensure you save the database.
-  
-  Note: HeidiSQL is much faster and more reliable for large SQL files!
+   Ensure you save the database.
+   
+   Note: HeidiSQL is much faster and more reliable for large SQL files!
 8. Copy the contents of the `input/uploads` into OpenWebUI's `uploads` directory.
 9. Start your OpenWebUI instance again.
