@@ -12,6 +12,7 @@ import hashlib
 import sys
 import ijson
 import mmap
+from tqdm import tqdm
 from typing import Generator, Any, Tuple, List, Set, Dict
 
 # --- Helper Classes ---
@@ -367,7 +368,7 @@ def process_single_conversation(data: dict, json_path: str, tags: list[str], upl
     )
     return sql, user_id, file_sqls
 
-def process_file_path(path: str, tags: list[str], uploads_dir: str, output_file, embed_images: bool, batch_size: int) -> Set[str]:
+def process_file_path(path: str, tags: list[str], uploads_dir: str, output_file, embed_images: bool, batch_size: int, pbar: tqdm = None) -> Set[str]:
     """Reads a file (which can be a list or dict) and writes SQL to output."""
     user_ids = set()
     
@@ -388,8 +389,38 @@ def process_file_path(path: str, tags: list[str], uploads_dir: str, output_file,
                     is_list = True
                 break
         
+        # Helper to wrap file for tqdm
+        # We only wrap if we have a pbar provided
+        def get_file_ctx():
+            if pbar:
+                return tqdm.wrapattr(open(path, 'rb'), "read", total=os.path.getsize(path), file=pbar)
+            return open(path, 'rb')
+
+        # Since we use one global pbar, we can't easily use wrapattr for multiple files unless we update the global one.
+        # Instead, let's create a wrapper class that updates the pbar manually.
+        
+        class ProgressFile:
+            def __init__(self, path, pbar):
+                self.f = open(path, 'rb')
+                self.pbar = pbar
+                
+            def read(self, size=-1):
+                data = self.f.read(size)
+                if self.pbar:
+                    self.pbar.update(len(data))
+                return data
+                
+            def close(self):
+                self.f.close()
+                
+            def __enter__(self):
+                return self
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.close()
+
         if is_list:
-            with open(path, 'rb') as f:
+            with ProgressFile(path, pbar) as f:
                 # Iterate over items in the list
                 # ijson.items(f, 'item') parses each item in the top-level list
                 items = ijson.items(f, 'item')
@@ -406,12 +437,14 @@ def process_file_path(path: str, tags: list[str], uploads_dir: str, output_file,
                         
                         if count % batch_size == 0:
                             output_file.flush()
-                            sys.stderr.write(f"\rProcessed {count} conversations in {os.path.basename(path)}")
-                
-                sys.stderr.write(f"\nFinished {path}: {count} conversations\n")
+                            if pbar:
+                                pbar.set_description(f"Processing (convs: {count})")
         else:
             # Assume single object
-            with open(path, "r", encoding="utf-8") as f:
+            # For single object, ijson works but json.load is simpler if it fits. 
+            # But we want progress. Let's stick to reading with ProgressFile and json.load
+            # json.load accepts a file-like object with .read()
+            with ProgressFile(path, pbar) as f:
                 data = json.load(f)
             
             # Handle the case where it might be wrapped in a list but short (old behavior)
@@ -468,23 +501,27 @@ def main() -> None:
     files = gather_files(args.files)
     all_user_ids = set()
     
-    print(f"Processing {len(files)} files to {output_path}...")
+    # Calculate total size
+    total_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+    
+    print(f"Processing {len(files)} files ({total_size / (1024*1024):.2f} MB) to {output_path}...")
     
     # Open output file once
     with open(output_path, "w", encoding="utf-8-sig") as out_f:
-        # Write header or initial statements if needed?
-        # out_f.write("BEGIN TRANSACTION;\n") # Maybe? SQLite might lock.
-        
-        for fpath in files:
-            uids = process_file_path(
-                fpath, 
-                tags, 
-                uploads_dir, 
-                out_f, 
-                not args.no_embed_images, 
-                args.batch_size
-            )
-            all_user_ids.update(uids)
+        # Use a single progress bar for all files
+        with tqdm(total=total_size, unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+            for fpath in files:
+                pbar.set_description(f"Processing {os.path.basename(fpath)}")
+                uids = process_file_path(
+                    fpath, 
+                    tags, 
+                    uploads_dir, 
+                    out_f, 
+                    not args.no_embed_images, 
+                    args.batch_size,
+                    pbar
+                )
+                all_user_ids.update(uids)
 
         # Write tag upserts at the end
         if all_user_ids:
@@ -493,10 +530,8 @@ def main() -> None:
                 stmts = tag_upserts(uid, tags)
                 for stmt in stmts:
                     out_f.write(stmt + "\n")
-        
-        # out_f.write("COMMIT;\n")
 
-    print(f"SQL written to {output_path}")
+    print(f"\nSQL written to {output_path}")
 
 if __name__ == "__main__":
     main()
