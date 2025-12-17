@@ -1,1 +1,3 @@
 jsonschema
+ijson
+memory_profiler
