@@ -23,9 +23,36 @@ def sanitize_text(text: Any) -> str:
     return INVALID_RE.sub("", text)
 
 
-MODEL = "openai/GPT-5"
-MODEL_NAME = "OpenAI: GPT-5"
 SUBDIR = "chatgpt"
+
+# Mapping of ChatGPT model slugs to OpenWebUI model identifiers
+MODEL_SLUG_MAPPING = {
+    "gpt-5-2": "openai/gpt-5.2",
+    "gpt-5-1": "openai/gpt-5.1",
+    "gpt-5": "openai/gpt-5",
+    "gpt-4o": "openai/chatgpt-4o-latest",
+    "gpt-4-turbo": "openai/gpt-4-turbo",
+    "gpt-4.1": "openai/gpt-4.1",
+    "gpt-4": "openai/gpt-4",
+    "gpt-3.5-turbo": "openai/gpt-3.5-turbo",
+    "auto": "openai/gpt-5",  # Default fallback
+}
+
+MODEL_NAME_MAPPING = {
+    "gpt-5-2": "ChatGPT 5.2",
+    "gpt-5-1": "ChatGPT 5.1",
+    "gpt-5": "ChatGPT 5",
+    "gpt-4o": "ChatGPT 4o (latest)",
+    "gpt-4-turbo": "ChatGPT 4 Turbo",
+    "gpt-4.1": "ChatGPT 4.1",
+    "gpt-4": "ChatGPT 4",
+    "gpt-3.5-turbo": "ChatGPT 3.5 Turbo",
+    "auto": "ChatGPT 5",
+}
+
+# Fallback defaults
+DEFAULT_MODEL = "openai/gpt-5"
+DEFAULT_MODEL_NAME = "ChatGPT 5"
 
 
 def extract_last_sentence(text: Any) -> str:
@@ -233,6 +260,31 @@ def parse_timestamp(value: Any, default: float) -> float:
     return default
 
 
+def extract_model_slug(messages: List[dict]) -> str:
+    """Extract model_slug from message metadata."""
+    if not messages:
+        return "auto"
+    
+    # Look for model_slug in message metadata, prioritize assistant messages
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("metadata", {}).get("model_slug"):
+            return msg["metadata"]["model_slug"]
+    
+    # Fallback to looking in any message
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("model_slug"):
+            return msg["model_slug"]
+    
+    return "auto"
+
+
+def get_model_from_slug(model_slug: str) -> Tuple[str, str]:
+    """Get OpenWebUI model and name from ChatGPT model slug."""
+    model = MODEL_SLUG_MAPPING.get(model_slug, DEFAULT_MODEL)
+    model_name = MODEL_NAME_MAPPING.get(model_slug, DEFAULT_MODEL_NAME)
+    return model, model_name
+
+
 def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: str = None, media_dir: str = None, media_url_prefix: str = "media", user_id: str = "") -> List[dict]:
     conversations = data if isinstance(data, list) else [data]
     result = []
@@ -243,7 +295,12 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
         ts_raw = item.get("create_time") or item.get("update_time") or time.time()
         ts = parse_timestamp(ts_raw, time.time())
         conv_id = item.get("conversation_id") or item.get("id")
+        
+        # Extract model slug from conversation level or message metadata
+        model_slug = item.get("model_slug") or item.get("default_model_slug", "auto")
+        
         messages: List[Tuple[str, str, float, List[Dict]]] = []
+        message_nodes: List[dict] = []  # Store message nodes to extract model_slug
         if isinstance(item.get("chat_messages"), list):
             for idx, msg in enumerate(item["chat_messages"]):
                 text = msg.get("text")
@@ -254,6 +311,11 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                 if text or msg_files:
                     role = "user" if idx % 2 == 0 else "assistant"
                     messages.append((role, text, ts, msg_files))
+                    message_nodes.append(msg)
+                    # Try to extract model_slug from message
+                    msg_model_slug = msg.get("model_slug") or msg.get("metadata", {}).get("model_slug")
+                    if msg_model_slug and model_slug == "auto":
+                        model_slug = msg_model_slug
         elif isinstance(item.get("mapping"), dict):
             mapping = item["mapping"]
             node = None
@@ -274,6 +336,11 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                             text = sanitize_text(text)
                             if text or msg_files:
                                 stack.append((role, text, parse_timestamp(ts_val, ts), msg_files))
+                                message_nodes.append(msg)
+                                # Try to extract model_slug from message metadata
+                                msg_model_slug = msg.get("metadata", {}).get("model_slug")
+                                if msg_model_slug and model_slug == "auto":
+                                    model_slug = msg_model_slug
                     parent_id = node.get("parent")
                     if not parent_id:
                         break
@@ -305,6 +372,11 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
                                 text = sanitize_text(text)
                                 if text or msg_files:
                                     messages.append((role, text, parse_timestamp(ts_val, ts), msg_files))
+                                    message_nodes.append(msg)
+                                    # Try to extract model_slug from message metadata
+                                    msg_model_slug = msg.get("metadata", {}).get("model_slug")
+                                    if msg_model_slug and model_slug == "auto":
+                                        model_slug = msg_model_slug
                         next_ids = node.get("children") or []
         else:
             messages.append(("user", title, ts, []))
@@ -356,6 +428,7 @@ def parse_chatgpt(data: Any, assets_mapping: Dict[str, str] = None, export_dir: 
             "timestamp": ts,
             "messages": messages,
             "conversation_id": conv_id,
+            "model_slug": model_slug,
         })
     return result
 
@@ -365,6 +438,11 @@ def build_webui(conversation: dict, user_id: str) -> Tuple[Dict[str, Any], str]:
     messages_map: Dict[str, Any] = {}
     messages_list: List[Dict[str, Any]] = []
     prev_id: str | None = None
+    
+    # Extract model information from conversation
+    model_slug = conversation.get("model_slug", "auto")
+    model, model_name = get_model_from_slug(model_slug)
+    
     for role, content, ts, msg_files in conversation["messages"]:
         msg_id = str(uuid.uuid4())
         clean = sanitize_text(content)
@@ -378,12 +456,12 @@ def build_webui(conversation: dict, user_id: str) -> Tuple[Dict[str, Any], str]:
             "files": msg_files
         }
         if role == "user":
-            msg["models"] = [MODEL]
+            msg["models"] = [model]
         else:
             msg.update(
                 {
-                    "model": MODEL,
-                    "modelName": MODEL_NAME,
+                    "model": model,
+                    "modelName": model_name,
                     "modelIdx": 0,
                     "userContext": None,
                     "lastSentence": extract_last_sentence(clean),
@@ -399,7 +477,7 @@ def build_webui(conversation: dict, user_id: str) -> Tuple[Dict[str, Any], str]:
     webui = {
         "id": "",
         "title": conversation["title"],
-        "models": [MODEL],
+        "models": [model],
         "params": {},
         "history": {"messages": messages_map, "currentId": prev_id},
         "messages": messages_list,
